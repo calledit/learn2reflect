@@ -10,6 +10,33 @@ This self-model is then used as a training signal in a second phase, directing c
 
 ## Method
 
+```
+    ┌──────────────────────────────┐
+    │                              │
+    ▼                              │
+┌───────────────────────┐          │
+│        Phase 1        │          │
+│                       │          │
+│  primary loss         │          │
+│  + reflection loss    │          │
+│                       │          │
+│  reflection head      │          │
+│  calibrates           │          │
+└──────────┬────────────┘          │
+           │                       │
+           │  every N steps        │
+           │  after warmup         │
+           ▼                       │
+┌───────────────────────┐          │
+│        Phase 2        │          │
+│                       │          │
+│  reflection gradient  │          │
+│  scaled upward        │          │
+└──────────┬────────────┘          │
+           │                       │
+           └───────────────────────┘
+```
+
 ### Phase 1 — loss self-modelling
 
 The model is extended with a *reflection head*: a single linear layer that shares the same internal representations as the primary output and produces one scalar per position — a predicted loss value.
@@ -21,6 +48,33 @@ During Phase 1, the reflection head is trained by comparing its predictions agai
 Once the reflection head is calibrated, Phase 2 begins. The reflection head has identified neurons with high predicted loss — but the objective is not to suppress those neurons directly. Their elevated loss is an honest signal; suppressing it would remove information without addressing the underlying problem.
 
 Instead, Phase 2 traces the signal upstream. In the forward pass, input enters at the top of the network and activations flow downward through the layers. A neuron with high predicted loss near the output is a symptom — the cause is most likely higher up, in an earlier layer or representation. Phase 2 sends the gradient of the reflection head's predictions back upward through the network, scaled by `(n_layers - layer_index) / n_layers`.
+
+```
+   Input
+     │
+     ▼
+┌─────────┐
+│ Block 0 │ ◄════════════════════════  scale = 8/8
+└────┬────┘
+     │
+     ▼
+┌─────────┐
+│ Block 1 │ ◄══════════════════════    scale = 7/8
+└────┬────┘
+     ·
+     ·
+┌─────────┐
+│ Block 7 │ ◄══                        scale = 1/8
+└────┬────┘
+     │
+     ▼
+┌─────────────┐  ┌─────────────────┐
+│ Output Head │  │ Reflection Head │   scale = 0.0  (protected)
+└─────────────┘  └────────┬────────┘
+                           │
+                    high-loss positions
+                    drive Phase 2 gradient ↑
+```
 
 The scaling serves three purposes:
 
