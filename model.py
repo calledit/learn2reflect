@@ -73,6 +73,7 @@ class Generator(nn.Module):
         self.norm = nn.LayerNorm(cfg.d_model)
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         self.lm_head.weight = self.tok_emb.weight  # weight tying
+        self.reflection_head = nn.Linear(cfg.d_model, 1, bias=True)
 
         self.apply(self._init_weights)
         # Scale residual projections by 1/sqrt(2 * n_layers) — GPT-2 recipe
@@ -88,12 +89,14 @@ class Generator(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, T] token ids → logits: [B, T, vocab_size]"""
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x: [B, T] → (logits: [B, T, vocab_size], loss_pred: [B, T])"""
         B, T = x.shape
         assert T <= self.cfg.context_length, f"Input length {T} exceeds context_length {self.cfg.context_length}"
         pos = torch.arange(T, device=x.device)
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         h = self.blocks(h)
         h = self.norm(h)
-        return self.lm_head(h)
+        logits    = self.lm_head(h)
+        loss_pred = self.reflection_head(h).squeeze(-1)  # [B, T]
+        return logits, loss_pred

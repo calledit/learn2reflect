@@ -43,11 +43,14 @@ def main():
                 continue
             if len(parts) < len(header):
                 parts += [""] * (len(header) - len(parts))
+            elif len(parts) > len(header):
+                parts = parts[:len(header)]
             chunks.append(parts)
 
     df = pd.DataFrame(chunks, columns=header)
     df["step"] = pd.to_numeric(df["step"], errors="coerce")
-    for col in ["train_loss", "val_loss", "lr", "elapsed_s", "tok_per_s"]:
+    for col in ["train_loss", "primary_loss", "reflection_loss", "phase2_loss",
+                "val_loss", "lr", "elapsed_s", "tok_per_s"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -58,10 +61,12 @@ def main():
 
     print(f"Loaded {len(df)} rows, steps {df['step'].min():.0f} – {df['step'].max():.0f}")
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
     fig.suptitle("Generator Training", fontsize=14)
 
-    def plot(ax, col, label, color, set_ylabel=True):
+    def plot(ax, col, label, color):
+        if col not in df.columns:
+            return
         data = df[col].dropna()
         if data.empty:
             return
@@ -73,18 +78,27 @@ def main():
             ax.plot(s_steps, s, color=color, linewidth=1.8, label=label)
         else:
             ax.plot(steps, data, color=color, linewidth=1.8, label=label)
-        if set_ylabel:
-            ax.set_ylabel(label)
         ax.legend(loc="upper right")
         ax.grid(True, alpha=0.3)
 
-    plot(axes[0], "train_loss", "train loss", "steelblue")
-    plot(axes[0], "val_loss",   "val loss",   "darkorange")
+    # Panel 0 — primary language model loss + validation
+    plot(axes[0], "train_loss",   "train loss",   "steelblue")
+    plot(axes[0], "primary_loss", "primary loss", "cornflowerblue")
+    plot(axes[0], "val_loss",     "val loss",     "darkorange")
     axes[0].set_title("Cross-Entropy Loss")
+    axes[0].set_ylabel("loss")
 
-    plot(axes[1], "lr", "learning rate (Prodigy)", "seagreen")
-    axes[1].set_title("Learning Rate")
-    axes[1].set_yscale("log")
+    # Panel 1 — reflection losses (Phase 1 MSE + Phase 2 descent)
+    plot(axes[1], "reflection_loss", "reflection loss (Phase 1)", "mediumpurple")
+    plot(axes[1], "phase2_loss",     "phase 2 loss",              "crimson")
+    axes[1].set_title("Reflection Losses")
+    axes[1].set_ylabel("loss")
+
+    # Panel 2 — learning rate
+    plot(axes[2], "lr", "learning rate (Prodigy)", "seagreen")
+    axes[2].set_title("Learning Rate")
+    axes[2].set_ylabel("lr")
+    axes[2].set_yscale("log")
 
     axes[-1].set_xlabel("Step")
     plt.tight_layout()

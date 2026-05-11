@@ -76,8 +76,8 @@ def generate(
         ctx = context[-cfg.context_length:]
         x   = torch.tensor(ctx, dtype=torch.long, device=device).unsqueeze(0)
 
-        logits   = model(x)             # [1, T, vocab_size]
-        logits   = logits[0, -1, :]    # last position
+        logits, _ = model(x)            # [1, T, vocab_size], [1, T]
+        logits    = logits[0, -1, :]   # last position
         logits   = logits / temperature
         probs    = F.softmax(logits, dim=-1)
         next_tok = torch.multinomial(probs, num_samples=1).item()
