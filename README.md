@@ -78,9 +78,9 @@ Instead, Phase 2 traces the signal upstream. In the forward pass, input enters a
 
 The scaling serves three purposes:
 
-1. **Gradient diminishing** — gradients can weaken as they travel upward through the network. Scaling compensates so the signal reaches the upper layers where the causes are most likely to reside.
-2. **Causal direction** — the location of the root cause is unknown, but we apply the heuristic that causes precede their effects. The scaling expresses this: layers closer to the input receive the strongest signal, on the grounds that they are more likely to be the source of downstream errors.
-3. **Phase 1 recovery cost** — Phase 2 runs interleaved with Phase 1. The layers closest to the reflection head are left largely undisturbed so that the signal pathways remain intact and Phase 1 does not spend steps rebuilding calibration that was already in place.
+1. **Causal direction** — the location of the root cause is unknown, but we apply the heuristic that causes precede their effects. The scaling expresses this: layers closer to the input receive the strongest signal, on the grounds that they are more likely to be the source of downstream errors.
+2. **Phase 1 recovery cost** — Phase 2 runs interleaved with Phase 1. The layers closest to the reflection head are left largely undisturbed so that the signal pathways remain intact and Phase 1 does not spend steps rebuilding calibration that was already in place.
+3. **Gradient diminishing** — gradients can weaken as they travel upward through the network (depending on architecture). Scaling can compensate so the signal reaches the upper layers where the causes are most likely to reside.
 
 The parameters below the transformer blocks — the output head and the reflection head itself — receive zero gradient from Phase 2. The output head is part of the primary objective; the reflection head is the detector and must not be disturbed.
 

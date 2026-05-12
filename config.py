@@ -18,7 +18,7 @@ class Config:
 
     # Training
     lr: float = 1.0           # Prodigy scale factor — keep at 1.0
-    max_iters: int = 500_000
+    max_iters: int = 4500_000
     eval_interval: int = 250
     eval_iters: int = 50      # number of context-length chunks evaluated per val check
     grad_clip: float = 1.0

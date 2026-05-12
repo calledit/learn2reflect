@@ -49,7 +49,7 @@ def main():
 
     df = pd.DataFrame(chunks, columns=header)
     df["step"] = pd.to_numeric(df["step"], errors="coerce")
-    for col in ["train_loss", "primary_loss", "reflection_loss", "phase2_loss",
+    for col in ["train_loss", "primary_loss", "pred_loss", "reflection_loss", "phase2_loss",
                 "val_loss", "lr", "elapsed_s", "tok_per_s"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -84,6 +84,7 @@ def main():
     # Panel 0 — primary language model loss + validation
     plot(axes[0], "train_loss",   "train loss",   "steelblue")
     plot(axes[0], "primary_loss", "primary loss", "cornflowerblue")
+    plot(axes[0], "pred_loss",    "predicted loss (reflection head)", "mediumpurple")
     plot(axes[0], "val_loss",     "val loss",     "darkorange")
     axes[0].set_title("Cross-Entropy Loss")
     axes[0].set_ylabel("loss")
