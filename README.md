@@ -1,12 +1,12 @@
 # learn2reflect
 
-A training method in which a model develops self-knowledge of its own error structure, then uses that self-knowledge to direct its own improvement.
+A training method in which a language model develops an explicit self-model of its own error structure and uses that self-model to direct its own improvement.
 
 ## Overview
 
-Standard training is agnostic to a model's own error structure — the loss is computed, gradients are propagated, and weights are updated, but the model itself has no representation of where it fails or why. Reflection Learning extends the model with a *reflector*: a second transformer that forms part of the model itself, attending to its own internal representations layer by layer and producing a calibrated, per-token estimate of its own loss.
+Standard training is agnostic to a model's internal error structure: the loss is computed, gradients are propagated, and weights are updated, but the model itself maintains no representation of where it fails or why. Reflection Learning addresses this by augmenting the model with a *reflector* — a secondary transformer that forms an integral part of the model, attending to its internal representations layer by layer and producing a calibrated, per-token estimate of its own cross-entropy loss.
 
-This self-model is then used as a training signal, directing corrective pressure back through the same representational pathways the reflector observes.
+This self-model is then used as an auxiliary training signal, directing corrective gradient pressure back through the same representational pathways the reflector observes.
 
 ## Method
 
@@ -35,22 +35,22 @@ This self-model is then used as a training signal, directing corrective pressure
 
 ### Reflector — loss self-modelling
 
-The reflector is a second transformer that runs in parallel with the primary *generator*. It has the same number of layers but a smaller hidden dimension. Each reflector block contains:
+The reflector is a transformer that runs in parallel with the primary *generator*. It has the same number of layers but a smaller hidden dimension. Each reflector block contains:
 
 - **Causal self-attention** over its own sequence
-- **Causal cross-attention** to the corresponding generator block's hidden states
+- **Causal cross-attention** to the hidden states of the corresponding generator block
 
-Because the cross-attention is layer-for-layer, the reflector observes not just the generator's final output but how each layer contributes to the representation at every position. Over time it builds a calibrated internal map of the generator's error distribution.
+The layer-for-layer cross-attention means the reflector observes not merely the generator's final output but the evolution of each token's representation across all depths. Over training, it is expected to build a calibrated internal map of the generator's error distribution.
 
-The reflector is trained by comparing its per-token predictions against the generator's actual per-token cross-entropy loss (MSE). The generator's hidden states are detached for this backward pass — the reflector calibrates on what the generator currently is, without pushing the generator in any direction.
+The reflector is supervised by comparing its per-token predictions against the generator's actual per-token cross-entropy loss via MSE. The generator's hidden states are detached for this backward pass, so the reflector calibrates against the generator's current behaviour without exerting any gradient pressure on the generator.
 
-### Causal correction — phase 2
+### Corrective signal
 
-After a warmup period, a second gradient signal is introduced. The reflector is run again on the same batch, this time with the generator's hidden states connected to the computation graph. The gradient of the reflector's predictions with respect to the generator's parameters is computed and added to the generator's update.
+After a warmup period, a second gradient signal is introduced. The reflector is run again on the same batch, this time with the generator's hidden states connected to the computation graph. The gradient of the reflector's mean predicted loss with respect to the generator's parameters is computed and added to the generator's update.
 
-This gradient flows backward through the reflector's cross-attention connections, then continues up through the generator's own layers. The effect: generator parameters whose representations most strongly drive the reflector's high-loss predictions receive the strongest corrective signal. The causal structure is not imposed by a manual scaling heuristic — it emerges naturally from which layer's representations the reflector learned to rely on.
+This gradient flows backward through the reflector's cross-attention connections into the generator's own layers. Generator parameters whose representations most strongly drive the reflector's high-loss predictions receive the strongest corrective signal. The corrective signal specifies no target output — it is, in effect, a standing instruction to the generator: *keep doing what you are doing, but try to be less uncertain about it.*
 
-The two objectives combine in a single forward pass per step:
+The two objectives are combined within a single forward pass per training step:
 
 ```
 generator loss  =  primary loss
@@ -59,25 +59,27 @@ generator loss  =  primary loss
 reflector loss  =  mse(reflector(hidden_states_detached), per_token_loss)
 ```
 
-Each is updated by its own optimizer. The generator's update does not touch reflector weights; the reflector's update does not reach generator weights.
+Each component is updated by its own independent optimizer. The generator's update does not affect reflector weights; the reflector's update does not propagate into the generator.
 
 ## Relationship to prior work
 
-### GANs
+### Generative adversarial networks
 
-Reflection Learning is structurally similar to GAN training. There are two networks: the generator, which is trying to produce representations the reflector reads as low-loss; and the reflector, which is trying to accurately predict the generator's actual loss. These objectives are in tension — the generator is incentivised to mislead the reflector, and the reflector is incentivised to not be misled.
+Reflection Learning is structurally analogous to GAN training. The generator is incentivised to produce hidden-state representations that the reflector reads as low-loss; the reflector is incentivised to accurately predict the generator's actual loss. These objectives are in tension, creating an implicit adversarial dynamic.
 
-The key differences from a GAN concern what keeps the system stable.
+Three properties distinguish this system from a conventional GAN and are expected to provide stability.
 
-In a GAN there is no constraint on the generator beyond fooling the discriminator. It can sacrifice any aspect of output quality in pursuit of that goal, which is why GAN training is fragile. Here the generator operates under a hard constraint — the primary language modelling loss — that it cannot sacrifice. Producing representations the reflector reads as low-loss is only useful if those representations also produce good predictions. If the generator manages to mislead the reflector without actually improving, the reflector's MSE loss corrects it on the next step, since the ground truth (actual per-token loss) is always available as a training target.
+First, the generator operates under a hard constraint — the primary language modelling loss — that cannot be sacrificed. Producing representations the reflector reads as low-loss is beneficial only insofar as those representations also support accurate next-token prediction. A generator that deceives the reflector without genuinely improving will be corrected on subsequent steps, because the reflector's MSE target is always the actual per-token loss.
 
-The reflector also has full visibility into every layer of the generator through layer-for-layer cross-attention. In a GAN the discriminator sees only the generator's output, leaving a single interface to exploit. Here there is no such bottleneck — the reflector observes the entire computational history of every token at every depth.
+Second, the corrective signal is weighted at a fraction of the primary loss (`phase2_weight = 0.1`). Where uncertainty is genuinely irreducible — inherent ambiguity in the data rather than a failure of the generator's representations — the corrective gradient opposes the primary loss gradient, and the two partially cancel. The primary loss thereby acts as a natural veto against pressure that cannot be resolved into a genuine improvement.
 
-Whether these constraints are sufficient to prevent the adversarial dynamic from producing unhelpful oscillations rather than genuine improvement remains an open empirical question.
+Third, the reflector has full visibility into every layer of the generator through layer-for-layer cross-attention. A conventional discriminator observes only the generator's output, exposing a single narrow interface that may be exploited. Here there is no such bottleneck; the reflector observes the complete computational history of every token at every depth.
+
+Whether these constraints are sufficient to prevent the adversarial dynamic from producing unhelpful oscillations rather than genuine representational improvement remains an open empirical question.
 
 ## Limitations
 
-Reflection training does not direct the generator toward any specific target — it pushes only away from representations the reflector associates with high loss. The assumption is that the generator consolidates onto more stable patterns as a result. Whether this produces genuinely better representations or merely representations that are harder for the reflector to classify remains an open empirical question.
+The corrective signal does not direct the generator toward any specific target; it applies pressure only away from representations the reflector associates with high predicted loss. The implicit assumption is that the generator will consolidate onto more stable and generalisable patterns as a result. Whether this produces genuinely improved representations or merely representations that are harder for the reflector to assign high loss to remains an open empirical question.
 
 ## Usage
 
