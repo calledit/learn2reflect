@@ -48,7 +48,7 @@ The reflector is supervised by comparing its per-token predictions against the g
 
 After a warmup period, a second gradient signal is introduced. The reflector is run again on the same batch, this time with the generator's hidden states connected to the computation graph. The gradient of the reflector's mean predicted loss with respect to the generator's parameters is computed and added to the generator's update.
 
-This gradient flows backward through the reflector's cross-attention connections into the generator's own layers. Generator parameters whose representations most strongly drive the reflector's high-loss predictions receive the strongest corrective signal. The corrective signal specifies no target output — it is, in effect, a standing instruction to the generator: *keep doing what you are doing, but try to be less uncertain about it.*
+This gradient flows backward through the reflector's cross-attention connections into the generator's own layers. Generator parameters whose representations most strongly drive the reflector's high-loss predictions receive the strongest corrective signal.
 
 The two objectives are combined within a single forward pass per training step:
 
@@ -60,6 +60,8 @@ reflector loss  =  mse(reflector(hidden_states_detached), per_token_loss)
 ```
 
 Each component is updated by its own independent optimizer. The generator's update does not affect reflector weights; the reflector's update does not propagate into the generator.
+
+Together, the two objectives amount to a standing instruction to the generator: *keep doing what you are doing, but try to be less uncertain about it.* The primary loss enforces the first clause; the corrective signal enforces the second.
 
 ## Relationship to prior work
 
