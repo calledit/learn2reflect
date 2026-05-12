@@ -189,6 +189,10 @@ def train():
                 p2_pred_loss_accum = 0.0
                 n_accum = cfg.phase2_grad_accum_steps
                 p2_params = list(model.parameters())
+
+                # Collect one gradient sample per accumulation step; accumulate
+                # primary loss gradients normally in the same loop.
+                grad_samples = []
                 for i in range(n_accum):
                     idx = (i * cfg.phase2_batch_size) % batch.size(0)
                     x1 = batch[idx : idx + cfg.phase2_batch_size, :-1]
@@ -199,29 +203,44 @@ def train():
                         logits_p2.reshape(-1, cfg.vocab_size), y1.reshape(-1), reduction='none'
                     ).reshape(B2, T2)
                     primary_loss_p2 = per_token_loss_p2.mean()
-                    # Reflection: isolate grads, scale, manually accumulate
+                    # Collect reflection gradient sample without altering param.grad
                     r_grads = torch.autograd.grad(
-                        loss_pred_p2.mean() / n_accum, p2_params,
+                        loss_pred_p2.mean(), p2_params,
                         retain_graph=True, allow_unused=True,
                     )
-                    for (name, param), g in zip(model.named_parameters(), r_grads):
-                        if g is None:
-                            continue
-                        if name.startswith('blocks.'):
-                            li = int(name.split('.')[1])
-                            scale = (cfg.n_layers - li) / cfg.n_layers
-                        elif name.startswith('tok_emb') or name.startswith('pos_emb'):
-                            scale = 1.0
-                        else:
-                            scale = 0.0
-                        if param.grad is None:
-                            param.grad = g * scale
-                        else:
-                            param.grad.add_(g * scale)
+                    grad_samples.append(r_grads)
                     # Primary: normal gradient flow accumulated on top
                     (primary_loss_p2 / n_accum).backward()
                     p2_loss_accum      += (primary_loss_p2 + loss_pred_p2.mean()).item() / n_accum
                     p2_pred_loss_accum += loss_pred_p2.mean().item() / n_accum
+
+                # Compute variance gradient: for each parameter, stack samples,
+                # subtract the mean, then take element-wise std deviation.
+                # Signed by the mean direction so the update is non-zero.
+                # High-variance elements (where samples disagree) get large updates;
+                # common/shared components (the mean) are subtracted out.
+                for param_idx, (name, param) in enumerate(model.named_parameters()):
+                    grads = [s[param_idx] for s in grad_samples if s[param_idx] is not None]
+                    if not grads:
+                        continue
+                    stacked  = torch.stack(grads)           # [n_accum, *shape]
+                    mean_g   = stacked.mean(0)
+                    centered = stacked - mean_g.unsqueeze(0)
+                    std_g    = centered.pow(2).mean(0).add(1e-12).sqrt()
+                    variance_grad = std_g * mean_g.sign()   # signed variance gradient
+
+                    if name.startswith('blocks.'):
+                        li = int(name.split('.')[1])
+                        scale = (cfg.n_layers - li) / cfg.n_layers
+                    elif name.startswith('tok_emb') or name.startswith('pos_emb'):
+                        scale = 1.0
+                    else:
+                        scale = 0.0
+                    if param.grad is None:
+                        param.grad = variance_grad * scale
+                    else:
+                        param.grad.add_(variance_grad * scale)
+
                 phase2_optimizer.step()
                 phase2_loss_sum   += p2_pred_loss_accum
                 phase2_loss_count += 1
