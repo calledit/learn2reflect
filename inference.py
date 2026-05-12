@@ -38,7 +38,7 @@ def load_checkpoint(path: str = None, device: str = None):
     state_dict = ckpt["model_state"]
     if any(k.startswith("_orig_mod.") for k in state_dict):
         state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(cfg.device)
     model.eval()
 

@@ -41,12 +41,13 @@ class Config:
     # Reflection loss weight (primary_loss + weight * reflection_loss)
     reflection_loss_weight: float = 1.0
 
-    # Phase 2 — adversarial self-stress
-    phase2_start_iter:  int   = 20000   # wait for reflection head to calibrate
-    phase2_interval:    int   = 10     # Phase 2 step every N Phase 1 steps
-    phase2_lr:          float = 1e-4
-    phase2_batch_size:       int   = 1    # 1 = idiosyncratic errors, 256 = systematic errors
-    phase2_grad_accum_steps: int   = 16    # accumulate N samples before each Phase 2 step
+    # Reflection transformer
+    reflection_d_model: int = 64
+    reflection_n_heads: int = 4
+
+    # Phase 2 — causal correction (active after warmup)
+    phase2_start_iter: int   = 585000   # wait for reflector to calibrate
+    phase2_weight:     float = 0.1      # scale of phase2 gradient relative to primary
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
