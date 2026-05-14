@@ -29,19 +29,22 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_step)
 
 
-def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, docs_consumed, cfg):
+def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, fn_optimizer,
+                    group_reward_ema, group_reward_var_ema, grad_updates, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
-    data = {
-        "model_state":     model.state_dict(),
-        "reflector_state": reflector.state_dict(),
-        "gen_opt_state":   gen_optimizer.state_dict(),
-        "ref_opt_state":   ref_optimizer.state_dict(),
-        "grad_updates":    grad_updates,
-        "docs_consumed":   docs_consumed,
-        "cfg":             cfg,
-    }
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_{grad_updates:07d}.pt")
-    torch.save(data, path)
+    torch.save({
+        "model_state":         model.state_dict(),
+        "reflector_state":     reflector.state_dict(),
+        "gen_opt_state":       gen_optimizer.state_dict(),
+        "ref_opt_state":       ref_optimizer.state_dict(),
+        "fn_opt_state":        fn_optimizer.state_dict(),
+        "group_reward_ema":    group_reward_ema.cpu(),
+        "group_reward_var_ema": group_reward_var_ema.cpu(),
+        "grad_updates":        grad_updates,
+        "docs_consumed":       docs_consumed,
+        "cfg":                 cfg,
+    }, path)
     print(f"  [ckpt] step {grad_updates} → {path}")
 
 
@@ -50,9 +53,9 @@ def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates
 @torch.no_grad()
 def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config, offset: int = 0) -> tuple[float, int]:
     model.eval()
-    device    = next(model.parameters()).device
-    total     = 0.0
-    n_chunks  = (len(val_data) - 1) // cfg.context_length
+    device   = next(model.parameters()).device
+    total    = 0.0
+    n_chunks = (len(val_data) - 1) // cfg.context_length
     for k in range(cfg.eval_iters):
         i = ((offset + k) % n_chunks) * cfg.context_length
         x = val_data[i     : i + cfg.context_length    ].unsqueeze(0).to(device)
@@ -74,7 +77,7 @@ def train():
     skip_docs = 0
     ckpt_path_early = find_latest_checkpoint(cfg.checkpoint_dir)
     if ckpt_path_early:
-        _peek = torch.load(ckpt_path_early, map_location="cpu", weights_only=False)
+        _peek     = torch.load(ckpt_path_early, map_location="cpu", weights_only=False)
         skip_docs = _peek.get("docs_consumed", 0)
         del _peek
         if skip_docs:
@@ -84,7 +87,7 @@ def train():
     print(f"Vocab: {cfg.vocab_size} | context_length: {cfg.context_length}")
 
     loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=False)
-    print(f"batch_size={cfg.batch_size} | grad_accum_steps={cfg.grad_accum_steps} | effective_batch={cfg.batch_size * cfg.grad_accum_steps}")
+    print(f"batch_size={cfg.batch_size}")
 
     model     = Generator(cfg).to(device)
     reflector = ReflectionTransformer(cfg).to(device)
@@ -102,6 +105,13 @@ def train():
         reflector.parameters(), lr=cfg.lr, weight_decay=0.1,
         safeguard_warmup=True, use_bias_correction=True,
     )
+    fn_params    = [p for block in model.blocks for fg in block.fn_groups for p in fg.parameters()]
+    fn_optimizer = torch.optim.AdamW(fn_params, lr=cfg.fn_isolation_lr)
+
+    n_groups             = cfg.n_layers * cfg.n_heads
+    group_reward_ema     = torch.zeros(n_groups, device=device)
+    group_reward_var_ema = torch.ones( n_groups, device=device)
+    ema_alpha            = 0.01
 
     # ── resume from checkpoint ────────────────────────────────────────────────
     grad_updates = 0
@@ -129,6 +139,14 @@ def train():
                 ref_optimizer.load_state_dict(ckpt["ref_opt_state"])
         except (ValueError, KeyError, RuntimeError):
             print("  ref optimizer state incompatible — starting fresh")
+        try:
+            if "fn_opt_state" in ckpt:
+                fn_optimizer.load_state_dict(ckpt["fn_opt_state"])
+        except (ValueError, KeyError, RuntimeError):
+            print("  fn optimizer state incompatible — starting fresh")
+        if "group_reward_ema" in ckpt:
+            group_reward_ema     = ckpt["group_reward_ema"].to(device)
+            group_reward_var_ema = ckpt["group_reward_var_ema"].to(device)
         grad_updates = ckpt["grad_updates"]
         print(f"  resumed at step {grad_updates}")
     else:
@@ -144,24 +162,20 @@ def train():
     log_file     = open(log_path, "a", newline="")
     log_writer   = csv.writer(log_file)
     if write_header:
-        log_writer.writerow(["step", "train_loss", "primary_loss", "pred_loss", "reflection_loss", "phase2_loss", "val_loss", "lr", "elapsed_s", "tok_per_s"])
+        log_writer.writerow(["step", "train_loss", "primary_loss", "pred_loss", "reflection_loss", "val_loss", "lr", "elapsed_s", "tok_per_s"])
 
     last_checkpoint_saved = grad_updates // cfg.checkpoint_interval
-    t0                = time.time()
-    t_last_log        = t0
+    t0               = time.time()
+    t_last_log       = t0
     train_loss_sum      = 0.0
     primary_loss_sum    = 0.0
     pred_loss_sum       = 0.0
     reflection_loss_sum = 0.0
-    phase2_loss_sum     = 0.0
-    phase2_loss_count   = 0
     train_loss_count    = 0
     tokens_since_log    = 0
-    micro_step          = 0
 
     gen_optimizer.zero_grad()
     ref_optimizer.zero_grad()
-    gen_params = list(model.parameters())
 
     for epoch in itertools.count(1):
         for batch in loader:
@@ -173,93 +187,129 @@ def train():
             y = batch[:, 1:]
             B, T = x.shape
 
-            # ── Forward: generator ───────────────────────────────────────────
-            logits, hidden_states = model(x)
+            causal_active      = (grad_updates >= cfg.reflection_start_iter and
+                                  grad_updates >= cfg.causal_finder_start_iter)
+            reflector_active   = grad_updates >= cfg.reflection_start_iter
 
+            # ── Stage 1: free forward/backward pass + causal finder selection ──
+            logits, hidden_states = model(x)
             per_token_loss = F.cross_entropy(
                 logits.reshape(-1, cfg.vocab_size), y.reshape(-1), reduction='none'
             ).reshape(B, T)
             primary_loss = per_token_loss.mean()
 
             if torch.isnan(primary_loss):
-                print(f"WARNING: NaN loss at step {grad_updates + 1}, skipping micro-batch")
+                print(f"WARNING: NaN loss at step {grad_updates + 1}, skipping batch")
                 gen_optimizer.zero_grad()
                 ref_optimizer.zero_grad()
-                micro_step = 0
                 continue
 
-            # ── Forward: reflector (detached) — trains reflector only ────────
-            reflector_active = grad_updates >= cfg.reflection_start_iter
+            log_prob = None
+            selected_layer = selected_head = None
+            reflection_mse = torch.tensor(0.0, device=device)
+            loss_pred      = torch.zeros(B, T, device=device)
+
             if reflector_active:
-                loss_pred      = reflector(x, [h.detach() for h in hidden_states])
+                if causal_active:
+                    loss_pred, sel_logits = reflector(
+                        x, [h.detach() for h in hidden_states], return_selection=True
+                    )
+                    dist           = torch.distributions.Categorical(
+                        logits=sel_logits / cfg.selection_temperature
+                    )
+                    sel_idx        = dist.sample()
+                    log_prob       = dist.log_prob(sel_idx)
+                    selected_layer = (sel_idx // cfg.n_heads).item()
+                    selected_head  = (sel_idx  % cfg.n_heads).item()
+                else:
+                    loss_pred = reflector(x, [h.detach() for h in hidden_states])
                 reflection_mse = F.mse_loss(loss_pred, per_token_loss.detach())
 
-            # ── Phase 2: reflector (connected) — gradient into generator ─────
-            phase2_active = reflector_active and grad_updates >= cfg.phase2_start_iter
-            if phase2_active:
-                loss_pred_p2 = reflector(x, hidden_states)
-                # Gradient flows through reflector into generator; retain_graph
-                # so the generator graph is intact for primary_loss.backward().
-                p2_grads = torch.autograd.grad(
-                    loss_pred_p2.mean(), gen_params,
-                    retain_graph=True, allow_unused=True,
-                )
-                for param, g in zip(gen_params, p2_grads):
-                    if g is None:
-                        continue
-                    g_scaled = cfg.phase2_weight * g / cfg.grad_accum_steps
-                    if param.grad is None:
-                        param.grad = g_scaled
-                    else:
-                        param.grad.add_(g_scaled)
-
-            # ── Backward: generator (primary loss) ───────────────────────────
-            (primary_loss / cfg.grad_accum_steps).backward()
-
-            # ── Backward: reflector (MSE, detached path — ref params only) ───
+            primary_loss.backward()
             if reflector_active:
-                (cfg.reflection_loss_weight * reflection_mse / cfg.grad_accum_steps).backward()
+                # retain_graph keeps the reflector graph alive so sel_loss.backward() can
+                # use it in stage 4. ref_optimizer must NOT step until after stage 4 to
+                # avoid in-place param modifications that would invalidate the retained graph.
+                (cfg.reflection_loss_weight * reflection_mse).backward(retain_graph=causal_active)
 
-            # ── Accumulators ─────────────────────────────────────────────────
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            gen_optimizer.step();  gen_optimizer.zero_grad()
+            if not causal_active:
+                torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
+                ref_optimizer.step();  ref_optimizer.zero_grad()
+
+            # ── Stage 2: activation caching pass ──────────────────────────────
+            fg_baseline = fg_final = 0.0
+            if causal_active:
+                with torch.no_grad():
+                    pos_  = torch.arange(T, device=device)
+                    h_    = model.drop(model.tok_emb(x) + model.pos_emb(pos_))
+                    cache_h = cache_heads = cache_fn_outs = None
+                    for i, blk in enumerate(model.blocks):
+                        if i == selected_layer:
+                            cache_h = h_.clone()
+                            h_, cache_heads, cache_fn_outs = blk.get_cache(h_)
+                        else:
+                            h_ = blk(h_)
+                    fg_baseline = F.cross_entropy(
+                        model.lm_head(model.norm(h_)).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                    ).item()
+
+                sibling_sum  = sum(fo for j, fo in enumerate(cache_fn_outs) if j != selected_head)
+                cached_head_ = cache_heads[:, :, selected_head, :].clone()
+
+                # ── Stage 3: isolated training of selected function group ──────
+                for p in model.parameters():
+                    p.requires_grad_(False)
+                sel_fg = model.blocks[selected_layer].fn_groups[selected_head]
+                for p in sel_fg.parameters():
+                    p.requires_grad_(True)
+
+                for _ in range(cfg.fn_isolation_steps):
+                    fn_optimizer.zero_grad()
+                    iso_loss = model.forward_from_cache(
+                        selected_layer, cache_h, selected_head, cached_head_, sibling_sum, y
+                    )
+                    iso_loss.backward()
+                    fn_optimizer.step()
+
+                fg_final = iso_loss.item()
+
+                for p in model.parameters():
+                    p.requires_grad_(True)
+
+                # ── Stage 4: REINFORCE update for selection head ───────────────
+                raw_reward = (fg_baseline - fg_final) / (abs(fg_baseline) + 1e-8)
+                g = selected_layer * cfg.n_heads + selected_head
+                group_reward_ema[g]     = (1 - ema_alpha) * group_reward_ema[g]     + ema_alpha * raw_reward
+                err                     = raw_reward - group_reward_ema[g].item()
+                group_reward_var_ema[g] = (1 - ema_alpha) * group_reward_var_ema[g] + ema_alpha * err * err
+                norm_reward             = err / (group_reward_var_ema[g].sqrt().item() + 1e-8)
+
+                sel_loss = -(log_prob * norm_reward)
+                sel_loss.backward()
+                torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
+                ref_optimizer.step()
+                ref_optimizer.zero_grad()
+
+            # ── Accumulators ──────────────────────────────────────────────────
             train_loss_sum      += primary_loss.item()
             primary_loss_sum    += primary_loss.item()
             if reflector_active:
                 pred_loss_sum       += loss_pred.detach().mean().item()
                 reflection_loss_sum += reflection_mse.item()
-            if phase2_active:
-                phase2_loss_sum   += loss_pred_p2.detach().mean().item()
-                phase2_loss_count += 1
             train_loss_count    += 1
             tokens_since_log    += B * T
-            micro_step          += 1
+            grad_updates        += 1
 
-            if micro_step < cfg.grad_accum_steps:
-                continue
-
-            # ── Optimizer steps ──────────────────────────────────────────────
-            torch.nn.utils.clip_grad_norm_(model.parameters(),     cfg.grad_clip)
-            torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
-            gen_optimizer.step()
-            ref_optimizer.step()
-            gen_optimizer.zero_grad()
-            ref_optimizer.zero_grad()
-            micro_step   = 0
-            grad_updates += 1
-
-            # ── Eval ─────────────────────────────────────────────────────────
+            # ── Eval ──────────────────────────────────────────────────────────
             if grad_updates % cfg.eval_interval == 0:
                 avg_train_loss      = train_loss_sum      / train_loss_count
                 avg_primary_loss    = primary_loss_sum    / train_loss_count
                 avg_pred_loss       = pred_loss_sum       / train_loss_count
                 avg_reflection_loss = reflection_loss_sum / train_loss_count
-                avg_phase2_loss     = phase2_loss_sum / phase2_loss_count if phase2_loss_count else 0.0
-                train_loss_sum      = 0.0
-                primary_loss_sum    = 0.0
-                pred_loss_sum       = 0.0
-                reflection_loss_sum = 0.0
-                phase2_loss_sum     = 0.0
-                phase2_loss_count   = 0
-                train_loss_count    = 0
+                train_loss_sum = primary_loss_sum = pred_loss_sum = reflection_loss_sum = 0.0
+                train_loss_count = 0
 
                 val_loss, val_offset = evaluate(model, val_data, cfg, val_offset)
                 elapsed   = time.time() - t0
@@ -273,13 +323,11 @@ def train():
                 model.train()
                 sample_line = " ".join(sample.split())
 
-                p2_str = f"p2 {avg_phase2_loss:.4f} | " if avg_phase2_loss else ""
                 print(
                     f"{grad_updates:7d}/{cfg.max_iters} | "
                     f"pl {avg_primary_loss:.4f} | "
                     f"rl {avg_reflection_loss:.4f} | "
                     f"pdl {avg_pred_loss:.4f} | "
-                    f"{p2_str}"
                     f"vl {val_loss:.4f} | "
                     f"lr {lr:.2e} | "
                     f"{tok_per_s/1000:.0f}k tok/s | "
@@ -292,7 +340,6 @@ def train():
                     f"{avg_primary_loss:.6f}",
                     f"{avg_pred_loss:.6f}",
                     f"{avg_reflection_loss:.6f}",
-                    f"{avg_phase2_loss:.6f}" if phase2_loss_count else "",
                     f"{val_loss:.6f}",
                     f"{lr:.6e}",
                     f"{elapsed:.1f}",
@@ -300,9 +347,14 @@ def train():
                 ])
                 log_file.flush()
 
+            # ── Checkpoint ────────────────────────────────────────────────────
             current_interval = grad_updates // cfg.checkpoint_interval
             if current_interval > last_checkpoint_saved:
-                save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, skip_docs + train_dataset.docs_consumed, cfg)
+                save_checkpoint(
+                    model, reflector, gen_optimizer, ref_optimizer, fn_optimizer,
+                    group_reward_ema, group_reward_var_ema,
+                    grad_updates, skip_docs + train_dataset.docs_consumed, cfg,
+                )
                 last_checkpoint_saved = current_interval
 
                 new_mtime = os.path.getmtime(_config_module.__file__)
@@ -317,7 +369,11 @@ def train():
         if grad_updates >= cfg.max_iters:
             break
 
-    save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, skip_docs + train_dataset.docs_consumed, cfg)
+    save_checkpoint(
+        model, reflector, gen_optimizer, ref_optimizer, fn_optimizer,
+        group_reward_ema, group_reward_var_ema,
+        grad_updates, skip_docs + train_dataset.docs_consumed, cfg,
+    )
     log_file.close()
     print(f"\nTraining done in {time.time() - t0:.0f}s")
     return model, tokenizer, cfg

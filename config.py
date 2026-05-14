@@ -8,9 +8,9 @@ class Config:
     vocab_size: int = 256
 
     # Architecture
-    d_model: int = 256
-    n_heads: int = 8        # head_dim = 32
-    n_layers: int = 16
+    d_model: int = 128
+    n_heads: int = 8        # head_dim = d_model // n_heads
+    n_layers: int = 8
     dropout: float = 0.0
 
     # Sequence length — attention window and training chunk size
@@ -36,21 +36,24 @@ class Config:
 
     # Batched training
     batch_size: int = 256
-    grad_accum_steps: int = 1     # effective batch size = batch_size * grad_accum_steps
 
-    # Reflection loss weight (primary_loss + weight * reflection_loss)
+    # Reflection loss weight
     reflection_loss_weight: float = 1.0
 
     # Steps before reflector training begins
-    reflection_start_iter: int = 4000000
+    reflection_start_iter: int = 5000
 
     # Reflection transformer
     reflection_d_model: int = 64
     reflection_n_heads: int = 4
 
-    # Phase 2 — causal correction (active after warmup)
-    phase2_start_iter: int   = 50000000   # wait for reflector to calibrate
-    phase2_weight:     float = 0.01      # scale of phase2 gradient relative to primary
+    # Function groups — MLP shape per head: head_dim → fn_hidden1 → fn_hidden2 → fn_hidden1 → d_model
+    fn_hidden1:               int   = 192
+    fn_hidden2:               int   = 256
+    fn_isolation_steps:       int   = 10         # isolated training steps per selected group per batch
+    fn_isolation_lr:          float = 3e-4       # AdamW LR for isolated training
+    selection_temperature:    float = 0.9        # softmax temperature when sampling group selection
+    causal_finder_start_iter: int   = 10000       # gate: wait for reflector to calibrate first
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
