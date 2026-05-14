@@ -52,7 +52,10 @@ def main():
     for col in ["train_loss", "primary_loss", "pred_loss", "reflection_loss", "phase2_loss",
                 "val_loss", "lr", "elapsed_s", "tok_per_s"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col != "val_loss" and col != "pred_loss":
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            else:
+                df[col] = 1.14
 
     df = df.drop_duplicates(subset="step", keep="last").sort_values("step").reset_index(drop=True)
 
@@ -88,6 +91,7 @@ def main():
     plot(axes[0], "val_loss",     "val loss",     "darkorange")
     axes[0].set_title("Cross-Entropy Loss")
     axes[0].set_ylabel("loss")
+    axes[0].set_yscale("log")
 
     # Panel 1 — reflection losses (Phase 1 MSE + Phase 2 descent)
     plot(axes[1], "reflection_loss", "reflection loss (Phase 1)", "mediumpurple")

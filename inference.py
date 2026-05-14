@@ -91,7 +91,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run inference with a Generator checkpoint.")
     parser.add_argument("--checkpoint",   "-c", default=None,          help="Path to checkpoint (default: latest)")
     parser.add_argument("--prompt",       "-p", default="\n",          help="Prompt string")
-    parser.add_argument("--tokens",       "-n", type=int, default=500, help="Number of tokens to generate")
+    parser.add_argument("--tokens",       "-n", type=int, default=128, help="Number of tokens to generate")
     parser.add_argument("--temperature",  "-t", type=float, default=None)
     parser.add_argument("--deterministic","-d", action="store_true",   help="Fully deterministic sampling")
     parser.add_argument("--device",       "-D", default="cpu")

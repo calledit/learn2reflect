@@ -10,8 +10,8 @@ class Config:
     # Architecture
     d_model: int = 256
     n_heads: int = 8        # head_dim = 32
-    n_layers: int = 8
-    dropout: float = 0.1
+    n_layers: int = 16
+    dropout: float = 0.0
 
     # Sequence length — attention window and training chunk size
     context_length: int = 128
@@ -41,13 +41,16 @@ class Config:
     # Reflection loss weight (primary_loss + weight * reflection_loss)
     reflection_loss_weight: float = 1.0
 
+    # Steps before reflector training begins
+    reflection_start_iter: int = 4000000
+
     # Reflection transformer
     reflection_d_model: int = 64
     reflection_n_heads: int = 4
 
     # Phase 2 — causal correction (active after warmup)
-    phase2_start_iter: int   = 585000   # wait for reflector to calibrate
-    phase2_weight:     float = 0.1      # scale of phase2 gradient relative to primary
+    phase2_start_iter: int   = 50000000   # wait for reflector to calibrate
+    phase2_weight:     float = 0.01      # scale of phase2 gradient relative to primary
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

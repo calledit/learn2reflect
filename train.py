@@ -29,7 +29,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     return max(files, key=_step)
 
 
-def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, cfg):
+def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, docs_consumed, cfg):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     data = {
         "model_state":     model.state_dict(),
@@ -37,6 +37,7 @@ def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates
         "gen_opt_state":   gen_optimizer.state_dict(),
         "ref_opt_state":   ref_optimizer.state_dict(),
         "grad_updates":    grad_updates,
+        "docs_consumed":   docs_consumed,
         "cfg":             cfg,
     }
     path = os.path.join(cfg.checkpoint_dir, f"checkpoint_{grad_updates:07d}.pt")
@@ -47,21 +48,19 @@ def save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates
 # ─────────────────────────────────────────────────────────────────── evaluation
 
 @torch.no_grad()
-def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config) -> float:
+def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config, offset: int = 0) -> tuple[float, int]:
     model.eval()
-    device = next(model.parameters()).device
-    total  = 0.0
-    n      = 0
-    for i in range(0, len(val_data) - cfg.context_length - 1, cfg.context_length):
+    device    = next(model.parameters()).device
+    total     = 0.0
+    n_chunks  = (len(val_data) - 1) // cfg.context_length
+    for k in range(cfg.eval_iters):
+        i = ((offset + k) % n_chunks) * cfg.context_length
         x = val_data[i     : i + cfg.context_length    ].unsqueeze(0).to(device)
         y = val_data[i + 1 : i + cfg.context_length + 1].unsqueeze(0).to(device)
         logits, _ = model(x)
         total += F.cross_entropy(logits.reshape(-1, cfg.vocab_size), y.reshape(-1)).item()
-        n += 1
-        if n >= cfg.eval_iters:
-            break
     model.train()
-    return total / max(n, 1)
+    return total / cfg.eval_iters, (offset + cfg.eval_iters) % n_chunks
 
 
 # ──────────────────────────────────────────────────────────────────── training
@@ -72,7 +71,16 @@ def train():
     device        = torch.device(cfg.device)
     print(f"Device: {device}")
 
-    train_dataset, val_data, tokenizer = build_dataset(cfg)
+    skip_docs = 0
+    ckpt_path_early = find_latest_checkpoint(cfg.checkpoint_dir)
+    if ckpt_path_early:
+        _peek = torch.load(ckpt_path_early, map_location="cpu", weights_only=False)
+        skip_docs = _peek.get("docs_consumed", 0)
+        del _peek
+        if skip_docs:
+            print(f"Checkpoint reports {skip_docs:,} documents consumed — will skip forward in stream")
+
+    train_dataset, val_data, tokenizer = build_dataset(cfg, skip_docs)
     print(f"Vocab: {cfg.vocab_size} | context_length: {cfg.context_length}")
 
     loader = DataLoader(train_dataset, batch_size=cfg.batch_size, shuffle=False)
@@ -126,7 +134,8 @@ def train():
     else:
         print("No checkpoint found — starting from scratch")
 
-    val_data = val_data.to(device)
+    val_data   = val_data.to(device)
+    val_offset = 0
 
     # ── logging ───────────────────────────────────────────────────────────────
     log_path     = os.path.join(cfg.checkpoint_dir, "training_log.csv")
@@ -180,11 +189,13 @@ def train():
                 continue
 
             # ── Forward: reflector (detached) — trains reflector only ────────
-            loss_pred    = reflector(x, [h.detach() for h in hidden_states])
-            reflection_mse = F.mse_loss(loss_pred, per_token_loss.detach())
+            reflector_active = grad_updates >= cfg.reflection_start_iter
+            if reflector_active:
+                loss_pred      = reflector(x, [h.detach() for h in hidden_states])
+                reflection_mse = F.mse_loss(loss_pred, per_token_loss.detach())
 
             # ── Phase 2: reflector (connected) — gradient into generator ─────
-            phase2_active = grad_updates >= cfg.phase2_start_iter
+            phase2_active = reflector_active and grad_updates >= cfg.phase2_start_iter
             if phase2_active:
                 loss_pred_p2 = reflector(x, hidden_states)
                 # Gradient flows through reflector into generator; retain_graph
@@ -206,13 +217,15 @@ def train():
             (primary_loss / cfg.grad_accum_steps).backward()
 
             # ── Backward: reflector (MSE, detached path — ref params only) ───
-            (cfg.reflection_loss_weight * reflection_mse / cfg.grad_accum_steps).backward()
+            if reflector_active:
+                (cfg.reflection_loss_weight * reflection_mse / cfg.grad_accum_steps).backward()
 
             # ── Accumulators ─────────────────────────────────────────────────
             train_loss_sum      += primary_loss.item()
             primary_loss_sum    += primary_loss.item()
-            pred_loss_sum       += loss_pred.detach().mean().item()
-            reflection_loss_sum += reflection_mse.item()
+            if reflector_active:
+                pred_loss_sum       += loss_pred.detach().mean().item()
+                reflection_loss_sum += reflection_mse.item()
             if phase2_active:
                 phase2_loss_sum   += loss_pred_p2.detach().mean().item()
                 phase2_loss_count += 1
@@ -248,7 +261,7 @@ def train():
                 phase2_loss_count   = 0
                 train_loss_count    = 0
 
-                val_loss  = evaluate(model, val_data, cfg)
+                val_loss, val_offset = evaluate(model, val_data, cfg, val_offset)
                 elapsed   = time.time() - t0
                 lr        = gen_optimizer.param_groups[0]['d'] * gen_optimizer.param_groups[0]['lr']
                 tok_per_s = tokens_since_log / max(time.time() - t_last_log, 1e-9)
@@ -289,7 +302,7 @@ def train():
 
             current_interval = grad_updates // cfg.checkpoint_interval
             if current_interval > last_checkpoint_saved:
-                save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, cfg)
+                save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, skip_docs + train_dataset.docs_consumed, cfg)
                 last_checkpoint_saved = current_interval
 
                 new_mtime = os.path.getmtime(_config_module.__file__)
@@ -304,7 +317,7 @@ def train():
         if grad_updates >= cfg.max_iters:
             break
 
-    save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, cfg)
+    save_checkpoint(model, reflector, gen_optimizer, ref_optimizer, grad_updates, skip_docs + train_dataset.docs_consumed, cfg)
     log_file.close()
     print(f"\nTraining done in {time.time() - t0:.0f}s")
     return model, tokenizer, cfg

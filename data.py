@@ -30,8 +30,9 @@ class SequenceDataset(IterableDataset):
     """
 
     def __init__(self, hf_dataset, context_length: int):
-        self.hf_dataset = hf_dataset
+        self.hf_dataset     = hf_dataset
         self.context_length = context_length
+        self.docs_consumed  = 0
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -46,6 +47,7 @@ class SequenceDataset(IterableDataset):
         for doc in dataset:
             buf.extend(doc["text"].encode("utf-8"))
             buf.append(10)  # \n separator between documents
+            self.docs_consumed += 1
             while len(buf) >= self.context_length + 1:
                 chunk = torch.tensor(buf[: self.context_length + 1], dtype=torch.long)
                 yield chunk
@@ -72,14 +74,14 @@ _FINEWEB_VAL_DOCS = 500
 _FINEWEB_SHUFFLE_BUFFER = 10_000
 
 
-def _build_fineweb_dataset(cfg: Config):
+def _build_fineweb_dataset(cfg: Config, skip_docs: int = 0):
     from datasets import load_dataset
 
     print("Loading FineWeb-Edu (streaming)...")
 
     def _stream():
         return load_dataset(
-            "HuggingFaceFW/fineweb-edu", name="sample-10BT",
+            "HuggingFaceFW/fineweb-edu",
             split="train", streaming=True,
         )
 
@@ -89,8 +91,10 @@ def _build_fineweb_dataset(cfg: Config):
     )
     val_data = torch.tensor(bytearray(val_bytes), dtype=torch.long)
 
-    train_stream = _stream().skip(_FINEWEB_VAL_DOCS).shuffle(buffer_size=_FINEWEB_SHUFFLE_BUFFER)
+    train_stream = _stream().skip(_FINEWEB_VAL_DOCS + skip_docs).shuffle(buffer_size=_FINEWEB_SHUFFLE_BUFFER)
 
+    if skip_docs:
+        print(f"  Skipping {skip_docs:,} already-consumed documents (one-time cost)...")
     print(f"  Val: {len(val_bytes):,} bytes | Train: streaming with buffer-shuffle {_FINEWEB_SHUFFLE_BUFFER:,}")
     return SequenceDataset(train_stream, cfg.context_length), val_data
 
@@ -173,11 +177,11 @@ def _load_oasst2() -> tuple[bytes, bytes]:
     return train_text.encode("utf-8"), val_text.encode("utf-8")
 
 
-def build_dataset(cfg: Config):
+def build_dataset(cfg: Config, skip_docs: int = 0):
     tokenizer = ByteTokenizer()
 
     if cfg.dataset == "fineweb_edu":
-        train_dataset, val_data = _build_fineweb_dataset(cfg)
+        train_dataset, val_data = _build_fineweb_dataset(cfg, skip_docs)
         return train_dataset, val_data, tokenizer
 
     if cfg.dataset == "oasst2":
