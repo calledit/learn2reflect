@@ -19,8 +19,9 @@ class Config:
     # Training
     lr: float = 1.0           # Prodigy scale factor — keep at 1.0
     max_iters: int = 4500_000
-    eval_interval: int = 250
-    eval_iters: int = 50      # number of context-length chunks evaluated per val check
+    eval_interval: int = 50
+    eval_iters: int = 50      # number of forward passes per val check
+    eval_batch_size: int = 5  # sequences per val forward pass
     grad_clip: float = 1.0
 
     # Dataset — "wikitext103", "fineweb_edu", or "oasst2"
@@ -50,10 +51,16 @@ class Config:
     # Function groups — MLP shape per head: head_dim → fn_hidden1 → fn_hidden2 → fn_hidden1 → d_model
     fn_hidden1:               int   = 192
     fn_hidden2:               int   = 256
-    fn_isolation_steps:       int   = 10         # isolated training steps per selected group per batch
+    fn_isolation_steps:       int   = 5         # isolated training steps per selected group per batch
+    isolation_interval:       int   = 10         # run stages 2-4 only every N normal steps
     fn_isolation_lr:          float = 3e-4       # AdamW LR for isolated training
-    selection_temperature:    float = 0.9        # softmax temperature when sampling group selection
-    causal_finder_start_iter: int   = 10000       # gate: wait for reflector to calibrate first
+    selection_temperature:        float = 0.9     # softmax temperature when sampling group selection
+    causal_finder_start_iter:     int   = 10000   # gate: wait for reflector to calibrate first
+    # Selector training methods (can be combined)
+    selector_train_reinforce:     bool  = True    # train selector via REINFORCE + reward signal
+    selector_train_grad_norm:     bool  = False   # train selector via gradient norm supervision
+    entropy_bonus:                float = 0.01    # entropy regularization (used when reinforce active)
+    selector_loss_weight:         float = 1.0     # weight for gradient norm supervision loss
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"

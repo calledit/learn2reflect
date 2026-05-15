@@ -57,13 +57,14 @@ def evaluate(model: Generator, val_data: torch.Tensor, cfg: Config, offset: int 
     total    = 0.0
     n_chunks = (len(val_data) - 1) // cfg.context_length
     for k in range(cfg.eval_iters):
-        i = ((offset + k) % n_chunks) * cfg.context_length
-        x = val_data[i     : i + cfg.context_length    ].unsqueeze(0).to(device)
-        y = val_data[i + 1 : i + cfg.context_length + 1].unsqueeze(0).to(device)
+        idxs = [((offset + k * cfg.eval_batch_size + j) % n_chunks) * cfg.context_length
+                for j in range(cfg.eval_batch_size)]
+        x = torch.stack([val_data[i     : i + cfg.context_length    ] for i in idxs]).to(device)
+        y = torch.stack([val_data[i + 1 : i + cfg.context_length + 1] for i in idxs]).to(device)
         logits, _ = model(x)
         total += F.cross_entropy(logits.reshape(-1, cfg.vocab_size), y.reshape(-1)).item()
     model.train()
-    return total / cfg.eval_iters, (offset + cfg.eval_iters) % n_chunks
+    return total / cfg.eval_iters, (offset + cfg.eval_iters * cfg.eval_batch_size) % n_chunks
 
 
 # ──────────────────────────────────────────────────────────────────── training
@@ -173,6 +174,7 @@ def train():
     reflection_loss_sum = 0.0
     train_loss_count    = 0
     tokens_since_log    = 0
+    selection_counts    = torch.zeros(n_groups, dtype=torch.long)
 
     gen_optimizer.zero_grad()
     ref_optimizer.zero_grad()
@@ -190,6 +192,7 @@ def train():
             causal_active      = (grad_updates >= cfg.reflection_start_iter and
                                   grad_updates >= cfg.causal_finder_start_iter)
             reflector_active   = grad_updates >= cfg.reflection_start_iter
+            run_isolation      = causal_active and (grad_updates % cfg.isolation_interval == 0)
 
             # ── Stage 1: free forward/backward pass + causal finder selection ──
             logits, hidden_states = model(x)
@@ -204,13 +207,12 @@ def train():
                 ref_optimizer.zero_grad()
                 continue
 
-            log_prob = None
-            selected_layer = selected_head = None
+            selected_layer = selected_head = sel_idx = None
             reflection_mse = torch.tensor(0.0, device=device)
             loss_pred      = torch.zeros(B, T, device=device)
 
             if reflector_active:
-                if causal_active:
+                if run_isolation:
                     loss_pred, sel_logits = reflector(
                         x, [h.detach() for h in hidden_states], return_selection=True
                     )
@@ -218,7 +220,6 @@ def train():
                         logits=sel_logits / cfg.selection_temperature
                     )
                     sel_idx        = dist.sample()
-                    log_prob       = dist.log_prob(sel_idx)
                     selected_layer = (sel_idx // cfg.n_heads).item()
                     selected_head  = (sel_idx  % cfg.n_heads).item()
                 else:
@@ -226,37 +227,56 @@ def train():
                 reflection_mse = F.mse_loss(loss_pred, per_token_loss.detach())
 
             primary_loss.backward()
+
             if reflector_active:
-                # retain_graph keeps the reflector graph alive so sel_loss.backward() can
-                # use it in stage 4. ref_optimizer must NOT step until after stage 4 to
-                # avoid in-place param modifications that would invalidate the retained graph.
-                (cfg.reflection_loss_weight * reflection_mse).backward(retain_graph=causal_active)
+                ref_loss = cfg.reflection_loss_weight * reflection_mse
+                if run_isolation and cfg.selector_train_grad_norm:
+                    fg_grad_norms = [
+                        sum(p.grad.norm().item() ** 2 for p in fg.parameters() if p.grad is not None) ** 0.5
+                        for block in model.blocks for fg in block.fn_groups
+                    ]
+                    grad_target = int(max(range(len(fg_grad_norms)), key=lambda i: fg_grad_norms[i]))
+                    sel_supervision = F.cross_entropy(
+                        sel_logits.unsqueeze(0),
+                        torch.tensor([grad_target], device=device),
+                    )
+                    ref_loss = ref_loss + cfg.selector_loss_weight * sel_supervision
+                ref_loss.backward()
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             gen_optimizer.step();  gen_optimizer.zero_grad()
-            if not causal_active:
+            if reflector_active:
                 torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
                 ref_optimizer.step();  ref_optimizer.zero_grad()
+            del hidden_states
 
-            # ── Stage 2: activation caching pass ──────────────────────────────
+            # ── Stages 2-4: isolation on single hardest example ───────────────
             fg_baseline = fg_final = 0.0
-            if causal_active:
+            if run_isolation:
+                worst = per_token_loss.mean(dim=1).argmax().item()
+                sx    = x[worst:worst+1]
+                sy    = y[worst:worst+1]
+
+                # ── Stage 2: single example caching pass ──────────────────────
                 with torch.no_grad():
-                    pos_  = torch.arange(T, device=device)
-                    h_    = model.drop(model.tok_emb(x) + model.pos_emb(pos_))
-                    cache_h = cache_heads = cache_fn_outs = None
-                    for i, blk in enumerate(model.blocks):
-                        if i == selected_layer:
-                            cache_h = h_.clone()
-                            h_, cache_heads, cache_fn_outs = blk.get_cache(h_)
-                        else:
-                            h_ = blk(h_)
+                    logits_s, hidden_states_s, (cache_h, cache_heads, cache_fn_outs) = model(
+                        sx, cache_at_layer=selected_layer
+                    )
                     fg_baseline = F.cross_entropy(
-                        model.lm_head(model.norm(h_)).reshape(-1, cfg.vocab_size), y.reshape(-1)
+                        logits_s.reshape(-1, cfg.vocab_size), sy.reshape(-1)
                     ).item()
 
                 sibling_sum  = sum(fo for j, fo in enumerate(cache_fn_outs) if j != selected_head)
                 cached_head_ = cache_heads[:, :, selected_head, :].clone()
+
+                # ── Fresh reflector forward on single example (live graph) ─────
+                _, single_sel_logits = reflector(
+                    sx, [h.detach() for h in hidden_states_s], return_selection=True
+                )
+                single_dist = torch.distributions.Categorical(
+                    logits=single_sel_logits / cfg.selection_temperature
+                )
+                log_prob = single_dist.log_prob(sel_idx)
 
                 # ── Stage 3: isolated training of selected function group ──────
                 for p in model.parameters():
@@ -268,7 +288,7 @@ def train():
                 for _ in range(cfg.fn_isolation_steps):
                     fn_optimizer.zero_grad()
                     iso_loss = model.forward_from_cache(
-                        selected_layer, cache_h, selected_head, cached_head_, sibling_sum, y
+                        selected_layer, cache_h, selected_head, cached_head_, sibling_sum, sy
                     )
                     iso_loss.backward()
                     fn_optimizer.step()
@@ -279,18 +299,19 @@ def train():
                     p.requires_grad_(True)
 
                 # ── Stage 4: REINFORCE update for selection head ───────────────
-                raw_reward = (fg_baseline - fg_final) / (abs(fg_baseline) + 1e-8)
                 g = selected_layer * cfg.n_heads + selected_head
-                group_reward_ema[g]     = (1 - ema_alpha) * group_reward_ema[g]     + ema_alpha * raw_reward
-                err                     = raw_reward - group_reward_ema[g].item()
-                group_reward_var_ema[g] = (1 - ema_alpha) * group_reward_var_ema[g] + ema_alpha * err * err
-                norm_reward             = err / (group_reward_var_ema[g].sqrt().item() + 1e-8)
-
-                sel_loss = -(log_prob * norm_reward)
-                sel_loss.backward()
-                torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
-                ref_optimizer.step()
-                ref_optimizer.zero_grad()
+                selection_counts[g] += 1
+                if cfg.selector_train_reinforce:
+                    raw_reward = (fg_baseline - fg_final) / (abs(fg_baseline) + 1e-8)
+                    group_reward_ema[g]     = (1 - ema_alpha) * group_reward_ema[g]     + ema_alpha * raw_reward
+                    err                     = raw_reward - group_reward_ema[g].item()
+                    group_reward_var_ema[g] = (1 - ema_alpha) * group_reward_var_ema[g] + ema_alpha * err * err
+                    norm_reward             = err / (group_reward_var_ema[g].sqrt().item() + 1e-8)
+                    sel_loss = -(log_prob * norm_reward) - cfg.entropy_bonus * single_dist.entropy()
+                    sel_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(reflector.parameters(), cfg.grad_clip)
+                    ref_optimizer.step()
+                    ref_optimizer.zero_grad()
 
             # ── Accumulators ──────────────────────────────────────────────────
             train_loss_sum      += primary_loss.item()
@@ -323,6 +344,17 @@ def train():
                 model.train()
                 sample_line = " ".join(sample.split())
 
+                total_selections = selection_counts.sum().item()
+                if total_selections > 0:
+                    top_g     = selection_counts.argmax().item()
+                    top_pct   = 100.0 * selection_counts[top_g].item() / total_selections
+                    top_layer = top_g // cfg.n_heads
+                    top_head  = top_g  % cfg.n_heads
+                    sel_str   = f"top L{top_layer}H{top_head} {top_pct:.0f}%"
+                else:
+                    sel_str   = "sel n/a"
+                selection_counts.zero_()
+
                 print(
                     f"{grad_updates:7d}/{cfg.max_iters} | "
                     f"pl {avg_primary_loss:.4f} | "
@@ -331,6 +363,7 @@ def train():
                     f"vl {val_loss:.4f} | "
                     f"lr {lr:.2e} | "
                     f"{tok_per_s/1000:.0f}k tok/s | "
+                    f"{sel_str} | "
                     f"t: {elapsed:.0f}s | "
                     f"samp: {sample_line}"
                 )

@@ -108,18 +108,28 @@ class Generator(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """x: [B, T] → (logits: [B, T, vocab_size], hidden_states: list of n_layers [B, T, d_model])"""
+    def forward(self, x: torch.Tensor, cache_at_layer: int | None = None) -> tuple:
+        """x: [B, T] → (logits, hidden_states).
+        If cache_at_layer is set, also returns (cache_h, cache_heads, cache_fn_outs) for that layer."""
         B, T = x.shape
         assert T <= self.cfg.context_length
         pos = torch.arange(T, device=x.device)
         h = self.drop(self.tok_emb(x) + self.pos_emb(pos))
         hidden_states = []
-        for block in self.blocks:
-            h = block(h)
+        cache = None
+        for i, block in enumerate(self.blocks):
+            if cache_at_layer is not None and i == cache_at_layer:
+                cache_h = h.clone()
+                h, cache_heads, cache_fn_outs = block.get_cache(h)
+                cache = (cache_h, cache_heads, cache_fn_outs)
+            else:
+                h = block(h)
             hidden_states.append(h)
         h = self.norm(h)
-        return self.lm_head(h), hidden_states
+        logits = self.lm_head(h)
+        if cache is not None:
+            return logits, hidden_states, cache
+        return logits, hidden_states
 
     def forward_from_cache(
         self,
