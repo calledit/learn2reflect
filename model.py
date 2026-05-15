@@ -139,15 +139,22 @@ class Generator(nn.Module):
         cached_head_out: torch.Tensor,
         cached_sibling_sum: torch.Tensor,
         y: torch.Tensor,
+        token_idx: int | None = None,
     ) -> torch.Tensor:
         """Isolated-training forward starting from cached input at layer_idx.
-        Only the selected function group is in the computation graph."""
+        Only the selected function group is in the computation graph.
+        When token_idx is set, loss is computed only at that position."""
         h = self.blocks[layer_idx].forward_cached(
             h_cached, selected_head, cached_head_out, cached_sibling_sum
         )
         for i in range(layer_idx + 1, len(self.blocks)):
             h = self.blocks[i](h)
         logits = self.lm_head(self.norm(h))
+        if token_idx is not None:
+            return F.cross_entropy(
+                logits[0, token_idx, :].unsqueeze(0),
+                y[0, token_idx].unsqueeze(0),
+            )
         return F.cross_entropy(logits.reshape(-1, self.cfg.vocab_size), y.reshape(-1))
 
 
@@ -260,11 +267,14 @@ class ReflectionTransformer(nn.Module):
             nn.init.normal_(module.weight, std=0.02)
 
     def forward(self, x: torch.Tensor, hidden_states: list[torch.Tensor],
-                return_selection: bool = False) -> torch.Tensor | tuple:
+                return_selection: bool = False,
+                selection_token: tuple[int, int] | None = None) -> torch.Tensor | tuple:
         """
         x: [B, T]
         hidden_states: list of n_layers [B, T, d_gen] from Generator
         return_selection: also return selection logits [n_layers * n_heads]
+        selection_token: (b_idx, t_idx) — which token's representation to use for selection.
+            Required when return_selection=True for token-level credit assignment.
         """
         B, T = x.shape
         pos = torch.arange(T, device=x.device)
@@ -272,9 +282,10 @@ class ReflectionTransformer(nn.Module):
         for block, h_gen in zip(self.blocks, hidden_states):
             h = block(h, h_gen)
         h = self.norm(h)
-        loss_pred = self.loss_head(h).squeeze(-1)           # [B, T]
+        loss_pred = self.loss_head(h).squeeze(-1)                    # [B, T]
         if return_selection:
-            pooled          = h.mean(dim=1).mean(dim=0)    # [d_ref]
-            selection_logits = self.selection_head(pooled) # [n_layers * n_heads]
+            b_idx, t_idx     = selection_token
+            pooled           = h[b_idx, t_idx, :]                   # [d_ref]
+            selection_logits = self.selection_head(pooled)           # [n_layers * n_heads]
             return loss_pred, selection_logits
         return loss_pred

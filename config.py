@@ -19,7 +19,7 @@ class Config:
     # Training
     lr: float = 1.0           # Prodigy scale factor — keep at 1.0
     max_iters: int = 4500_000
-    eval_interval: int = 50
+    eval_interval: int = 100
     eval_iters: int = 50      # number of forward passes per val check
     eval_batch_size: int = 5  # sequences per val forward pass
     grad_clip: float = 1.0
@@ -51,8 +51,8 @@ class Config:
     # Function groups — MLP shape per head: head_dim → fn_hidden1 → fn_hidden2 → fn_hidden1 → d_model
     fn_hidden1:               int   = 192
     fn_hidden2:               int   = 256
-    fn_isolation_steps:       int   = 5         # isolated training steps per selected group per batch
-    isolation_interval:       int   = 10         # run stages 2-4 only every N normal steps
+    fn_isolation_steps:       int   = 2         # isolated training steps per selected group per batch
+    isolation_interval:       int   = 3         # run stages 2-4 only every N normal steps
     fn_isolation_lr:          float = 3e-4       # AdamW LR for isolated training
     selection_temperature:        float = 0.9     # softmax temperature when sampling group selection
     causal_finder_start_iter:     int   = 10000   # gate: wait for reflector to calibrate first

@@ -210,11 +210,16 @@ def train():
             selected_layer = selected_head = sel_idx = None
             reflection_mse = torch.tensor(0.0, device=device)
             loss_pred      = torch.zeros(B, T, device=device)
+            b_hard = t_hard = None
 
             if reflector_active:
                 if run_isolation:
+                    flat_idx = per_token_loss.detach().reshape(-1).argmax()
+                    b_hard   = (flat_idx // T).item()
+                    t_hard   = (flat_idx  % T).item()
                     loss_pred, sel_logits = reflector(
-                        x, [h.detach() for h in hidden_states], return_selection=True
+                        x, [h.detach() for h in hidden_states],
+                        return_selection=True, selection_token=(b_hard, t_hard),
                     )
                     dist           = torch.distributions.Categorical(
                         logits=sel_logits / cfg.selection_temperature
@@ -250,10 +255,10 @@ def train():
                 ref_optimizer.step();  ref_optimizer.zero_grad()
             del hidden_states
 
-            # ── Stages 2-4: isolation on single hardest example ───────────────
+            # ── Stages 2-4: isolation on single hardest token ────────────────
             fg_baseline = fg_final = 0.0
             if run_isolation:
-                worst = per_token_loss.mean(dim=1).argmax().item()
+                worst = b_hard
                 sx    = x[worst:worst+1]
                 sy    = y[worst:worst+1]
 
@@ -263,7 +268,8 @@ def train():
                         sx, cache_at_layer=selected_layer
                     )
                     fg_baseline = F.cross_entropy(
-                        logits_s.reshape(-1, cfg.vocab_size), sy.reshape(-1)
+                        logits_s[0, t_hard, :].unsqueeze(0),
+                        sy[0, t_hard].unsqueeze(0),
                     ).item()
 
                 sibling_sum  = sum(fo for j, fo in enumerate(cache_fn_outs) if j != selected_head)
@@ -271,7 +277,8 @@ def train():
 
                 # ── Fresh reflector forward on single example (live graph) ─────
                 _, single_sel_logits = reflector(
-                    sx, [h.detach() for h in hidden_states_s], return_selection=True
+                    sx, [h.detach() for h in hidden_states_s],
+                    return_selection=True, selection_token=(0, t_hard),
                 )
                 single_dist = torch.distributions.Categorical(
                     logits=single_sel_logits / cfg.selection_temperature
@@ -288,7 +295,8 @@ def train():
                 for _ in range(cfg.fn_isolation_steps):
                     fn_optimizer.zero_grad()
                     iso_loss = model.forward_from_cache(
-                        selected_layer, cache_h, selected_head, cached_head_, sibling_sum, sy
+                        selected_layer, cache_h, selected_head, cached_head_, sibling_sum, sy,
+                        token_idx=t_hard,
                     )
                     iso_loss.backward()
                     fn_optimizer.step()
